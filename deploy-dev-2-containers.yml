@@ -1,0 +1,93 @@
+name: deploy-dev
+
+on:
+  push:
+    branches:
+      - master
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: dev-loans
+  ECS_SERVICE: dev-loans
+  ECS_CLUSTER: finance
+  ECS_TASK_DEFINITION: .aws/dev-task-definition.json
+  CONTAINER_1_NAME: backend
+  CONTAINER_2_NAME: celery
+
+permissions:
+  contents: read
+
+jobs:
+  tests-on-the-build:
+    name: Testing the application
+    uses: ./.github/workflows/template-tests.yml
+    with:
+      aws-region: eu-west-1
+    secrets: inherit
+
+  build-and-deploy-application:
+    name: Build and deploy application
+    needs: ["tests-on-the-build"]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Container 1 - Fill in the new image ID in the ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_1_NAME }}
+          image: ${{ env.image }}
+
+      - name: Container 2 - Fill in the new image ID in the ECS task definition
+        id: task-def-2
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          container-name: ${{ env.CONTAINER_2_NAME }}
+          image: ${{ env.image }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-2.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  deploy-terraform:
+    uses: ./.github/workflows/template-terraform-deploy.yml
+    needs: ["tests-on-the-build"]
+    with:
+      username: "${{ github.actor }}"
+      app_name: loans
+      app_version: "${{ github.sha }}"
+      environment: Development
+      env: dev
+    secrets: inherit
